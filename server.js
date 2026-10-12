@@ -4,7 +4,7 @@ const crypto = require("crypto");
 require("dotenv").config();
 const db = require("./db");
 const app = express();
-const { sendConfirmation } = require("./sms");
+const { sendConfirmation, getSmsStatus } = require("./sms");
 app.use(cors());
 app.use(express.json());
 
@@ -72,6 +72,23 @@ const makeToken = (workerId) => {
     const signature = crypto.createHmac("sha256", tokenSecret).update(payload).digest("base64url");
     return `${payload}.${signature}`;
 };
+const makeAdminToken = () => {
+    const payload = Buffer.from(JSON.stringify({ admin: true, expires: Date.now() + 4 * 60 * 60 * 1000 })).toString("base64url");
+    const signature = crypto.createHmac("sha256", tokenSecret).update(payload).digest("base64url");
+    return `${payload}.${signature}`;
+};
+const requireAdmin = (req, res, next) => {
+    const [payload, signature] = (req.get("authorization") || "").replace(/^Bearer\s+/i, "").split(".");
+    if (!payload || !signature) return res.status(401).json({ message: "Office admin sign-in is required." });
+    const expected = crypto.createHmac("sha256", tokenSecret).update(payload).digest();
+    const supplied = Buffer.from(signature, "base64url");
+    if (expected.length !== supplied.length || !crypto.timingSafeEqual(expected, supplied)) return res.status(401).json({ message: "Invalid office admin session." });
+    try {
+        const session = JSON.parse(Buffer.from(payload, "base64url").toString());
+        if (!session.admin || session.expires < Date.now()) return res.status(401).json({ message: "Office admin session expired. Sign in again." });
+        next();
+    } catch { return res.status(401).json({ message: "Invalid office admin session." }); }
+};
 const requireWorker = (req, res, next) => {
     const [payload, signature] = (req.get("authorization") || "").replace(/^Bearer\s+/i, "").split(".");
     if (!payload || !signature) return res.status(401).json({ message: "Please sign in to continue." });
@@ -88,7 +105,7 @@ const requireWorker = (req, res, next) => {
 };
 
 
-app.post("/workers/login", (req, res) => {
+const authenticateWorker = (req, res) => {
     const { workerId, password } = req.body || {};
     if (typeof workerId !== "string" || !workerId.trim() || typeof password !== "string" || !password) {
         return res.status(400).json({ message: "Worker ID and password are required." });
@@ -134,6 +151,32 @@ app.post("/workers/login", (req, res) => {
             const matches = attemptedPassword.length === legacyPassword.length && crypto.timingSafeEqual(attemptedPassword, legacyPassword);
             finishLogin(matches);
         }
+    });
+};
+app.post("/workers/login", authenticateWorker);
+// Office admin sign-in is checked against the `admin` table.
+// `password` holds a scrypt hash written as salt:hash (see hash.js).
+const verifyAdminLogin = (username, password, callback) => {
+    if (!username || typeof password !== "string" || !password) return callback(null, false);
+    db.query("SELECT `password` FROM `Admin` WHERE `admin` = ? LIMIT 1", [username], (err, rows) => {
+        if (err) return callback(err);
+        const parts = String(rows[0]?.password || "").split(":");
+        if (!rows.length || parts.length !== 2 || !/^[a-f\d]{32}$/i.test(parts[0]) || !/^[a-f\d]{128}$/i.test(parts[1])) return callback(null, false);
+        crypto.scrypt(password, parts[0], 64, (hashError, derivedKey) => {
+            if (hashError) return callback(hashError);
+            const expected = Buffer.from(parts[1], "hex");
+            callback(null, derivedKey.length === expected.length && crypto.timingSafeEqual(derivedKey, expected));
+        });
+    });
+};
+app.post("/login", (req, res) => {
+    const { workerId, username, password } = req.body || {};
+    const loginId = String(workerId || username || "").trim();
+    verifyAdminLogin(loginId, password, (err, isAdmin) => {
+        if (err) console.error("Admin login lookup error:", err.code || err.message);
+        if (isAdmin) return res.json({ token: makeAdminToken(), role: "admin", adminId: loginId });
+        req.body = { ...(req.body || {}), workerId: loginId };
+        authenticateWorker(req, res);
     });
 });
 
@@ -223,15 +266,89 @@ app.get("/", (req, res) => {
         message: "Milk Collection System API is running"
     });
 });
+app.post("/admin/login", (req, res) => {
+    const suppliedUser = String(req.body?.username || "").trim();
+    const suppliedPassword = String(req.body?.password || "");
+    verifyAdminLogin(suppliedUser, suppliedPassword, (err, ok) => {
+        if (err) { console.error("Admin login database error:", err.code || err.message); return res.status(500).json({ message: "Could not check admin sign-in. Make sure the admin table exists." }); }
+        if (!ok) return res.status(401).json({ message: "The worker or office ID and password do not match." });
+        res.json({ token: makeAdminToken() });
+    });
+});
+app.get("/admin/messaging/status", requireAdmin, (req, res) => res.json(getSmsStatus()));
+app.get("/admin/dashboard", requireAdmin, (req, res) => {
+    const sql = `SELECT
+        (SELECT COUNT(*) FROM farmers WHERE status = 'active') AS activeFarmers,
+        (SELECT COUNT(*) FROM workers WHERE active = TRUE) AS activeWorkers,
+        (SELECT COUNT(*) FROM milk_collections WHERE collection_date = CURDATE()) AS collectionsToday,
+        (SELECT COALESCE(SUM(quantity_kg), 0) FROM milk_collections WHERE collection_date = CURDATE()) AS todayKg`;
+    db.query(sql, (err, rows) => {
+        if (err) { console.error("Admin dashboard database error:", err); return res.status(500).json({ message: "Could not load office dashboard." }); }
+        const stats = rows[0];
+        res.json({ activeFarmers: Number(stats.activeFarmers), activeWorkers: Number(stats.activeWorkers), collectionsToday: Number(stats.collectionsToday), todayKg: Number(stats.todayKg) });
+    });
+});
+app.get("/admin/routes", requireAdmin, (req, res) => {
+    db.query("SELECT id, route_name AS routeName FROM collection_routes WHERE active = TRUE ORDER BY route_name", (err, rows) => {
+        if (err) { console.error("Admin route list database error:", err); return res.status(500).json({ message: "Could not load routes. Run the latest backend/schema.sql." }); }
+        res.json(rows.map((row) => ({ id: Number(row.id), routeName: row.routeName })));
+    });
+});
+app.post("/admin/workers", requireAdmin, (req, res) => {
+    const workerId = String(req.body?.workerId || "").trim();
+    const password = String(req.body?.password || "");
+    const routeId = req.body?.routeId ? Number(req.body.routeId) : null;
+    if (!workerId || workerId.length > 50 || password.length < 8 || (routeId !== null && (!Number.isInteger(routeId) || routeId <= 0))) return res.status(400).json({ message: "Enter a worker ID, a password of at least 8 characters, and a valid route." });
+    const insert = (route) => {
+        const salt = crypto.randomBytes(16).toString("hex");
+        crypto.scrypt(password, salt, 64, (hashError, key) => {
+            if (hashError) return res.status(500).json({ message: "Could not secure the worker password." });
+            db.query("INSERT INTO workers (worker_id, password_hash, route_id) VALUES (?, ?, ?)", [workerId, `${salt}:${key.toString("hex")}`, route], (err) => {
+                if (err?.code === "ER_DUP_ENTRY") return res.status(409).json({ message: "That worker ID is already in use." });
+                if (err) { console.error("Admin worker insert database error:", err); return res.status(500).json({ message: "Could not add worker." }); }
+                res.status(201).json({ message: "Worker added.", workerId });
+            });
+        });
+    };
+    if (routeId === null) return insert(null);
+    db.query("SELECT id FROM collection_routes WHERE id = ? AND active = TRUE", [routeId], (err, rows) => {
+        if (err) { console.error("Admin worker route validation error:", err); return res.status(500).json({ message: "Could not check that route." }); }
+        if (!rows.length) return res.status(400).json({ message: "Choose an active collection route." });
+        insert(routeId);
+    });
+});
+app.post("/admin/farmers", requireAdmin, (req, res) => {
+    const farmerNumber = String(req.body?.farmerNumber || "").trim();
+    const firstName = String(req.body?.firstName || "").trim();
+    const phone = String(req.body?.phone || "").trim();
+    const routeId = req.body?.routeId ? Number(req.body.routeId) : null;
+    if (!farmerNumber || farmerNumber.length > 20 || !firstName || firstName.length > 50 || !phone || phone.length > 20 || (routeId !== null && (!Number.isInteger(routeId) || routeId <= 0))) return res.status(400).json({ message: "Enter a farmer number, name, phone, and a valid optional route." });
+    const cleanPhone = phone.replace(/[\s()-]/g, "");
+    if (!/^(?:0[17]\d{8}|254[17]\d{8}|\+254[17]\d{8})$/.test(cleanPhone)) return res.status(400).json({ message: "Enter a valid Kenyan mobile number, such as 0712 345 678 or +254 712 345 678." });
+    const insert = (route) => db.query("INSERT INTO farmers (farmer_number, first_name, phone, status, zone, route_id) VALUES (?, ?, ?, 'active', ?, ?)", [farmerNumber, firstName, phone, route?.routeName || null, route?.id || null], (err) => {
+        if (err?.code === "ER_DUP_ENTRY") return res.status(409).json({ message: "That farmer number already exists." });
+        if (err) { console.error("Admin farmer insert database error:", err); return res.status(500).json({ message: "Could not add farmer." }); }
+        res.status(201).json({ message: "Farmer added.", farmerNumber });
+    });
+    if (routeId === null) return insert(null);
+    db.query("SELECT id, route_name AS routeName FROM collection_routes WHERE id = ? AND active = TRUE", [routeId], (err, rows) => {
+        if (err) { console.error("Admin farmer route validation error:", err); return res.status(500).json({ message: "Could not check that route." }); }
+        if (!rows.length) return res.status(400).json({ message: "Choose an active collection route." });
+        insert(rows[0]);
+    });
+});
 app.get("/workers/dashboard", requireWorker, (req, res) => {
     const todaySql = `SELECT COALESCE(SUM(quantity_kg), 0) AS todayKg, COUNT(*) AS todayCount
         FROM milk_collections WHERE collector_id = ? AND collection_date = CURDATE()`;
     const routeSql = `SELECT r.route_name AS routeName,
         COALESCE(SUM(CASE WHEN w.route_id IS NULL OR collecting_worker.route_id = w.route_id THEN mc.quantity_kg ELSE 0 END), 0) AS routeKg,
-        COUNT(CASE WHEN w.route_id IS NULL OR collecting_worker.route_id = w.route_id THEN mc.id END) AS routeCount
+        COUNT(CASE WHEN w.route_id IS NULL OR collecting_worker.route_id = w.route_id THEN mc.id END) AS routeCount,
+        COUNT(DISTINCT CASE WHEN (w.route_id IS NULL OR collecting_worker.route_id = w.route_id) AND (w.route_id IS NULL OR collected_farmer.route_id = w.route_id) AND collected_farmer.status = 'active' THEN mc.farmer_number END) AS farmersCollected,
+        (SELECT COUNT(*) FROM farmers f WHERE f.status = 'active' AND (w.route_id IS NULL OR f.route_id = w.route_id)) AS farmersOnRoute
         FROM workers w LEFT JOIN collection_routes r ON r.id = w.route_id
         LEFT JOIN milk_collections mc ON mc.collection_date = CURDATE()
         LEFT JOIN workers collecting_worker ON collecting_worker.worker_id = mc.collector_id
+        LEFT JOIN farmers collected_farmer ON collected_farmer.farmer_number = mc.farmer_number
         WHERE w.worker_id = ? GROUP BY r.route_name`;
     const recentSql = `SELECT mc.farmer_number AS farmerNumber, f.first_name AS firstName,
         mc.quantity_kg AS quantityKg, DATE_FORMAT(mc.collection_date, '%Y-%m-%d') AS collectionDate,
@@ -255,7 +372,7 @@ app.get("/workers/dashboard", requireWorker, (req, res) => {
                     return res.status(500).json({ message: "Could not load route total. Run the route migration first." });
                 }
                 const route = routeTotals[0] || {};
-                res.json({ todayKg: Number(totals[0].todayKg), todayCount: Number(totals[0].todayCount), routeName: route.routeName || null, routeKg: Number(route.routeKg) || 0, routeCount: Number(route.routeCount) || 0, recent });
+                res.json({ todayKg: Number(totals[0].todayKg), todayCount: Number(totals[0].todayCount), routeName: route.routeName || null, routeKg: Number(route.routeKg) || 0, routeCount: Number(route.routeCount) || 0, farmersCollected: Number(route.farmersCollected) || 0, farmersOnRoute: Number(route.farmersOnRoute) || 0, recent });
             });
         });
     });
@@ -299,7 +416,7 @@ app.post("/milk", requireWorker, (req, res) => {
     const selectedDate = collectionDate || new Date().toISOString().slice(0, 10);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(selectedDate)) return res.status(400).json({ message: "Enter a valid collection date." });
     if (!farmerNumber || !Number.isFinite(Number(quantityKg)) || Number(quantityKg) <= 0) {
-        return res.status(400).json({ message: "A seller account and a quantity greater than zero are required." });
+        return res.status(400).json({ message: "A farmer account and a quantity greater than zero are required." });
     }
 
     const saveForFarmer = () => {
@@ -319,11 +436,12 @@ app.post("/milk", requireWorker, (req, res) => {
                     return res.status(500).json({ message: clientRecordId ? "Run the offline collection migration before syncing saved deliveries." : "Failed to record milk." });
                 }
                 res.status(201).json({ message: "Milk recorded successfully", collectionId: result.insertId, farmerNumber: farmer.farmer_number, firstName: farmer.first_name, quantityKg: Number(quantityKg) });
-                sendConfirmation({ phone: farmer.phone, firstName: farmer.first_name, farmerNumber: farmer.farmer_number, quantityKg, collectionDate: selectedDate });
+                sendConfirmation({ phone: farmer.phone, firstName: farmer.first_name, farmerNumber: farmer.farmer_number, quantityKg, collectionDate: selectedDate })
+                    .then((delivery) => console.info(`Collection SMS ${delivery.status} for collection ${result.insertId}.`));
             });
         };
         db.query("SELECT farmer_number, first_name, phone FROM farmers WHERE farmer_number = ? AND status = 'active'", [farmerNumber], (err, farmers) => {
-            if (err) { console.error("Farmer check database error:", err); return res.status(500).json({ message: "Could not verify the seller." }); }
+            if (err) { console.error("Farmer check database error:", err); return res.status(500).json({ message: "Could not verify the farmer." }); }
             if (!farmers.length) return res.status(404).json({ message: "Farmer not found or inactive." });
             insert(farmers[0]);
         });
@@ -381,6 +499,6 @@ console.log("Milk history route reached:", req.params.farmerNumber);
 });
 console.log("Milk history route loaded");
 const port = Number(process.env.PORT) || 3002;
-app.listen(port, () => {
+app.listen(port, "0.0.0.0", () => {
     console.log(`Milk System server running on port ${port}`);
 });
