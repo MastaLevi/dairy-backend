@@ -37,10 +37,10 @@ async function sendWithTextbee(to, message) {
     if (!response.ok) {
         const detail = await response.text().catch(() => "");
         console.error(`TextBee collection SMS failed (HTTP ${response.status}): ${detail.slice(0, 300)}`);
-        return { status: "rejected", statusCode: response.status };
+        return { status: "rejected", providerStatusCode: String(response.status) };
     }
     // 200 means TextBee queued it for the phone, not that the farmer has received it yet.
-    return { status: "accepted" };
+    return { status: "accepted", providerStatusCode: String(response.status) };
 }
 
 async function sendWithAfricasTalking(to, message) {
@@ -51,25 +51,26 @@ async function sendWithAfricasTalking(to, message) {
     if (!recipient) return { status: "no_recipient_status" };
     if (![100, 101, 102].includes(Number(recipient.statusCode))) {
         console.error(`Collection SMS was not accepted (status ${recipient.statusCode}).`);
-        return { status: "rejected", statusCode: Number(recipient.statusCode) };
+        return { status: "rejected", providerStatusCode: String(recipient.statusCode) };
     }
-    return { status: "accepted", statusCode: Number(recipient.statusCode) };
+    return { status: "accepted", providerStatusCode: String(recipient.statusCode) };
 }
 
 // Never throws and never blocks the milk record: a failed text is only logged.
 async function sendConfirmation({ phone, firstName, farmerNumber, quantityKg, collectionDate }) {
-    if (String(process.env.SMS_ENABLED).toLowerCase() === "false") return { status: "disabled" };
-
     const useTextbee = Boolean(textbeeKey());
-    if (!useTextbee && !atKey()) {
+    const provider = useTextbee ? "textbee" : (atKey() ? "africas_talking" : "none");
+    if (String(process.env.SMS_ENABLED).toLowerCase() === "false") return { status: "disabled", provider };
+
+    if (provider === "none") {
         console.warn("Collection SMS skipped: no TEXTBEE_API_KEY or AFRICASTALKING_API_KEY is set.");
-        return { status: "not_configured" };
+        return { status: "not_configured", provider };
     }
 
     const to = formatKenyanPhone(phone);
     if (!to) {
         console.warn(`Collection SMS skipped: invalid phone for farmer ${farmerNumber}.`);
-        return { status: "invalid_phone" };
+        return { status: "invalid_phone", provider };
     }
 
     const message = `Hello ${firstName || "farmer"}, ${Number(quantityKg).toLocaleString()} kg of milk was recorded for ${collectionDate} by Kwikas SACCO. Thank you.`;
@@ -77,10 +78,10 @@ async function sendConfirmation({ phone, firstName, farmerNumber, quantityKg, co
     try {
         const result = useTextbee ? await sendWithTextbee(to, message) : await sendWithAfricasTalking(to, message);
         if (result.status === "accepted") console.log(`Collection SMS queued for farmer ${farmerNumber} via ${useTextbee ? "TextBee" : "Africa's Talking"}.`);
-        return result;
+        return { ...result, provider };
     } catch (error) {
         console.error("Collection SMS failed:", error.message);
-        return { status: "error" };
+        return { status: "error", provider };
     }
 }
 

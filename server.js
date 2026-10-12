@@ -276,6 +276,20 @@ app.post("/admin/login", (req, res) => {
     });
 });
 app.get("/admin/messaging/status", requireAdmin, (req, res) => res.json(getSmsStatus()));
+app.get("/admin/messaging/deliveries", requireAdmin, (req, res) => {
+    db.query(`SELECT s.id, s.collection_id AS collectionId, s.provider, s.status,
+        s.provider_status_code AS providerStatusCode, s.attempted_at AS attemptedAt,
+        mc.farmer_number AS farmerNumber, mc.quantity_kg AS quantityKg, mc.collection_date AS collectionDate
+        FROM sms_delivery_attempts s
+        JOIN milk_collections mc ON mc.id = s.collection_id
+        ORDER BY s.id DESC LIMIT 50`, (err, rows) => {
+        if (err) {
+            console.error("SMS delivery history database error:", err.code || err.message);
+            return res.status(503).json({ message: "SMS delivery history is not ready. Apply the SMS delivery log migration and enable logging." });
+        }
+        res.json(rows.map((row) => ({ ...row, quantityKg: Number(row.quantityKg) })));
+    });
+});
 app.get("/admin/dashboard", requireAdmin, (req, res) => {
     const sql = `SELECT
         (SELECT COUNT(*) FROM farmers WHERE status = 'active') AS activeFarmers,
@@ -437,7 +451,15 @@ app.post("/milk", requireWorker, (req, res) => {
                 }
                 res.status(201).json({ message: "Milk recorded successfully", collectionId: result.insertId, farmerNumber: farmer.farmer_number, firstName: farmer.first_name, quantityKg: Number(quantityKg) });
                 sendConfirmation({ phone: farmer.phone, firstName: farmer.first_name, farmerNumber: farmer.farmer_number, quantityKg, collectionDate: selectedDate })
-                    .then((delivery) => console.info(`Collection SMS ${delivery.status} for collection ${result.insertId}.`));
+                    .then((delivery) => {
+                        console.info(`Collection SMS ${delivery.status} for collection ${result.insertId}.`);
+                        if (!/^(1|true|yes)$/i.test(process.env.SMS_DELIVERY_LOG_ENABLED || "")) return;
+                        db.query(`INSERT INTO sms_delivery_attempts
+                            (collection_id, provider, status, provider_status_code)
+                            VALUES (?, ?, ?, ?)`, [result.insertId, delivery.provider || "unknown", delivery.status, delivery.providerStatusCode || null], (logError) => {
+                            if (logError) console.error("Could not save SMS delivery status:", logError.code || logError.message);
+                        });
+                    });
             });
         };
         db.query("SELECT farmer_number, first_name, phone FROM farmers WHERE farmer_number = ? AND status = 'active'", [farmerNumber], (err, farmers) => {
