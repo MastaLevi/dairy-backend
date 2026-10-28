@@ -11,10 +11,24 @@ CREATE TABLE IF NOT EXISTS workers (
     password_hash VARCHAR(200) NOT NULL,
     route_id INT NULL,
     active BOOLEAN NOT NULL DEFAULT TRUE,
+    session_version INT NOT NULL DEFAULT 1,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_workers_route (route_id),
     CONSTRAINT fk_workers_route FOREIGN KEY (route_id)
         REFERENCES collection_routes(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS security_audit_events (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    actor_id VARCHAR(50) NOT NULL,
+    action VARCHAR(60) NOT NULL,
+    target_type VARCHAR(30) NOT NULL,
+    target_id VARCHAR(80) NOT NULL,
+    details JSON NULL,
+    source_ip VARCHAR(45) NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_security_audit_target (target_type, target_id, created_at),
+    INDEX idx_security_audit_actor (actor_id, created_at)
 );
 
 CREATE TABLE IF NOT EXISTS worker_passkeys (

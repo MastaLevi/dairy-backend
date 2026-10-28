@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "create-worker": "node create-worker.js",
+    "migrate-worker-passwords": "node migrate-legacy-worker-passwords.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "engines": {

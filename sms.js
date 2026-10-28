@@ -57,7 +57,7 @@ async function sendWithAfricasTalking(to, message) {
 }
 
 // Never throws and never blocks the milk record: a failed text is only logged.
-async function sendConfirmation({ phone, firstName, farmerNumber, quantityKg, collectionDate }) {
+async function sendConfirmation({ phone, firstName, farmerNumber, quantityKg, collectionDate, brandName = "Kwikas SACCO" }) {
     const useTextbee = Boolean(textbeeKey());
     const provider = useTextbee ? "textbee" : (atKey() ? "africas_talking" : "none");
     if (String(process.env.SMS_ENABLED).toLowerCase() === "false") return { status: "disabled", provider };
@@ -73,7 +73,8 @@ async function sendConfirmation({ phone, firstName, farmerNumber, quantityKg, co
         return { status: "invalid_phone", provider };
     }
 
-    const message = `Hello ${firstName || "farmer"}, ${Number(quantityKg).toLocaleString()} kg of milk was recorded for ${collectionDate} by Kwikas SACCO. Thank you.`;
+    const safeBrandName = brandName === "DairyFlow" ? "DairyFlow" : "Kwikas SACCO";
+    const message = `Hello ${firstName || "farmer"}, ${Number(quantityKg).toLocaleString()} kg of milk was recorded for ${collectionDate} by ${safeBrandName}. Thank you.`;
 
     try {
         const result = useTextbee ? await sendWithTextbee(to, message) : await sendWithAfricasTalking(to, message);
@@ -85,9 +86,35 @@ async function sendConfirmation({ phone, firstName, farmerNumber, quantityKg, co
     }
 }
 
-function getSmsStatus() {
-    if (textbeeKey()) return { configured: true, mode: "textbee" };
-    return { configured: Boolean(atKey()), mode: atUsername() === "sandbox" ? "sandbox" : "live" };
+async function sendFarmerLoginCode({ phone, code, brandName = "Dairy service" }) {
+    const useTextbee = Boolean(textbeeKey());
+    const provider = useTextbee ? "textbee" : (atKey() ? "africas_talking" : "none");
+    if (String(process.env.SMS_ENABLED).toLowerCase() === "false" || provider === "none") return { status: "not_configured", provider };
+    const to = formatKenyanPhone(phone);
+    if (!to) return { status: "invalid_phone", provider };
+    const safeBrandName = String(brandName || "Dairy service").replace(/[^\p{L}\p{N} .'-]/gu, "").slice(0, 40) || "Dairy service";
+    const message = `Your ${safeBrandName} farmer sign-in code is ${code}. It expires in 5 minutes. Do not share this code.`;
+    try {
+        return { ...(useTextbee ? await sendWithTextbee(to, message) : await sendWithAfricasTalking(to, message)), provider };
+    } catch (error) {
+        console.error("Farmer sign-in SMS failed:", error.message);
+        return { status: "error", provider };
+    }
 }
 
-module.exports = { sendConfirmation, getSmsStatus };
+function getSmsStatus() {
+    const enabled = String(process.env.SMS_ENABLED).toLowerCase() !== "false";
+    const provider = textbeeKey() ? "textbee" : (atKey() ? "africas_talking" : "none");
+    const mode = provider === "textbee" ? "textbee" : (atUsername() === "sandbox" ? "sandbox" : "live");
+    const configured = enabled && provider !== "none";
+    return {
+        configured,
+        enabled,
+        provider,
+        mode,
+        farmerOtpEnabled: configured,
+        deviceConfigured: provider === "textbee" ? Boolean(process.env.TEXTBEE_DEVICE_ID) : null
+    };
+}
+
+module.exports = { sendConfirmation, sendFarmerLoginCode, getSmsStatus };
