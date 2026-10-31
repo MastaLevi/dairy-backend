@@ -211,8 +211,14 @@ const authenticateWorker = (req, res) => {
     }
     db.query("SELECT worker_id, password_hash, active, session_version AS sessionVersion FROM workers WHERE worker_id = ? LIMIT 1", [workerId.trim()], (err, rows) => {
         if (err) {
-            console.error("Worker login database error:", err);
-            return res.status(500).json({ message: "Could not sign in. Check that the workers table is set up." });
+            console.error("Worker login database error:", err.code || err.message);
+            if (err.code === "ER_NO_SUCH_TABLE") {
+                return res.status(500).json({ message: "The database used by this API is missing its workers table. Set up the worker schema in the API database." });
+            }
+            if (err.code === "ER_BAD_FIELD_ERROR") {
+                return res.status(500).json({ message: "The workers table is missing a required column. Apply the worker security migration to the database used by this API." });
+            }
+            return res.status(500).json({ message: "Could not query worker records. Check the API database connection and worker schema." });
         }
         const worker = rows[0];
         if (!worker || !worker.active) return res.status(401).json({ message: "Worker ID or password is incorrect." });
@@ -458,6 +464,18 @@ app.get("/admin/farmers/unassigned", requireAdmin, (req, res) => {
     db.query("SELECT farmer_number AS farmerNumber, first_name AS firstName FROM farmers WHERE status = 'active' AND route_id IS NULL ORDER BY farmer_number LIMIT 500", (err, rows) => {
         if (err) { console.error("Unassigned farmer list failed:", err.code || err.message); return res.status(500).json({ message: "Could not load farmers without routes." }); }
         res.json(rows);
+    });
+});
+app.get("/admin/farmers/:farmerNumber", requireAdmin, (req, res) => {
+    const farmerNumber = String(req.params.farmerNumber || "").trim();
+    if (!farmerNumber || farmerNumber.length > 20) return res.status(400).json({ message: "Enter a valid farmer account number." });
+    db.query(`SELECT f.farmer_number AS farmerNumber, f.first_name AS firstName, f.phone,
+                     f.status, f.zone, f.route_id AS routeId, cr.route_name AS routeName
+              FROM farmers f LEFT JOIN collection_routes cr ON cr.id = f.route_id
+              WHERE f.farmer_number = ? LIMIT 1`, [farmerNumber], (err, rows) => {
+        if (err) { console.error("Admin farmer lookup failed:", err.code || err.message); return res.status(500).json({ message: "Could not look up this farmer." }); }
+        if (!rows.length) return res.status(404).json({ message: "No farmer account matches that number." });
+        res.json(rows[0]);
     });
 });
 app.put("/admin/farmers/:farmerNumber/route", requireAdmin, (req, res) => {
